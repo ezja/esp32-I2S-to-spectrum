@@ -1,5 +1,6 @@
-Audio spectrum analysis with ESP32 
 
+Audio spectrum analysis with ESP32 
+-----------------------------------
 -----------------------------------
 I2S microphone --> FFT --> averaging --> local flash storage (SPIFFS) and/or LoRaWAN.
 
