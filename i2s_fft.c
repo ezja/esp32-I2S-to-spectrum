@@ -19,27 +19,6 @@
 // Used static IRAM:   46424 bytes (  84648 available, 35.4% used)
 // ***************************************************************
 
-#include <stdio.h>
-#include <math.h>
-#include <string.h>
-#include <sys/unistd.h>
-#include <sys/stat.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "driver/i2s.h"
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_spiffs.h"
-#include "esp_system.h"
-#include "esp_sleep.h"
-#include "esp_dsp.h"
-#include "dsp_platform.h"
-#include "dsps_view.h"
-#include "dsps_fft2r.h"
-#include "freertos/ringbuf.h"
-#include "freertos/semphr.h"
-#include "esp_heap_caps.h"
 #include "i2s_fft.h"
 
 // ****************
