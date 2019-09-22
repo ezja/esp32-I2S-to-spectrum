@@ -1,7 +1,7 @@
 -----------------------
 Audio spectrum analysis with ESP32 
 -----------------------
-I2S microphone --> FFT --> averaging --> SPIFFS storage and/or LoRaWAN
+I2S microphone --> FFT --> averaging --> local flash storage (SPIFFS) and/or LoRaWAN
 
 Tested with INMP441 & SPH0465 microphones
 
