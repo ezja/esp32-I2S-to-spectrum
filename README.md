@@ -1,0 +1,18 @@
+-----------------------
+Audio spectrum analysis with ESP32 
+-----------------------
+I2S microphone --> FFT --> averaging --> SPIFFS storage and/or LoRaWAN
+
+Tested with INMP441 & SPH0465 microphones
+
+
+-----------------------------
+FFT routines: ESP-DSP library 
+-----------------------------
+https://github.com/espressif/esp-dsp
+
+
+-----------------------------
+LoRaWAN compression via wjmb
+-----------------------------------
+https://github.com/wjmb/FeatherM0_BEEP   
