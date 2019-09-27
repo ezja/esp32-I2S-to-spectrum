@@ -19,7 +19,30 @@
 // Used static IRAM:   46424 bytes (  84648 available, 35.4% used)
 // ***************************************************************
 
+
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+#include <sys/unistd.h>
+#include <sys/stat.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "driver/i2s.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_spiffs.h"
+#include "esp_system.h"
+#include "esp_sleep.h"
+#include "esp_dsp.h"
+#include "dsp_platform.h"
+#include "dsps_view.h"
+#include "dsps_fft2r.h"
+#include "freertos/ringbuf.h"
+#include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 #include "i2s_fft.h"
+
 
 // ****************
 // I2S mic select: 
@@ -27,21 +50,41 @@
 // #define INMP441
 // ****************
 
+
+// I2S sampling rate
 #define SAMPLERATE 6250 
+
 // FFT window size
 #define BLOCK_SIZE 2048
+
 // I2S ringbuffer size
 #define I2S_BUFFER_SIZE 2048      
 #define I2S_BUFFER_TYPE RINGBUF_TYPE_BYTEBUF
-// FFTs per LoRaWAN payload
+
+// FFTs to average per pass
 #define AVG_FFT_NR 2 
 
-size_t I2S_size = 2048;
-static int32_t samples[2048];
+// number of bins in LoRaWAN payload
+#define SELECTEDBINS ((ENDBIN-STARTBIN)/NR_OF_BINS_TO_COMBINE) 
+
+// bins per byte in LoRaWAN payload
+#define NR_OF_BINS_TO_COMBINE 5 
+
+// 98 Hz @ BLOCK_SIZE 2048 & SAMPLERATE 6250 kHz
+#define STARTBIN 16 
+
+// 586 Hz @ BLOCK_SIZE 2048 & SAMPLERATE 6250 kHz
+#define ENDBIN 96 
+#define I2S_size 2048
+// size_t I2S_size = 2048;
+
+
+static int32_t samples[I2S_size];
+int32_t samples_big[I2S_size*4];
 static RingbufHandle_t i2s_buffer = NULL;
 
 static float y_cf[BLOCK_SIZE*2]; 
-static float x1[BLOCK_SIZE];
+//static float x1[BLOCK_SIZE];
 static float wind[BLOCK_SIZE*2];
 static float output_data_float_log[BLOCK_SIZE];
 static float output_data_float_lin[BLOCK_SIZE];
@@ -57,6 +100,10 @@ static uint8_t s_code[64];
 
 // deep sleep interval
 int64_t sleep_us = 50000000;
+
+int16_t fft_cnt = 1;
+size_t bytes_read = 0;
+
 
 // ***********************************
 // s_spectrum is de LoRaWAN payload!
@@ -106,10 +153,19 @@ static void init_i2s()
 	    // pin config 
 	    i2s_pin_config_t pin_config_rx = {
 		    .bck_io_num = GPIO_NUM_21, 
-		    .ws_io_num = GPIO_NUM_18,
+		    .ws_io_num = GPIO_NUM_22,
 		    .data_out_num = -1,
-		    .data_in_num = GPIO_NUM_19
+		    .data_in_num = GPIO_NUM_23
 		};
+
+     gpio_set_direction(GPIO_NUM_21, GPIO_MODE_OUTPUT);
+     gpio_set_direction(GPIO_NUM_22, GPIO_MODE_OUTPUT);
+     gpio_set_direction(GPIO_NUM_23, GPIO_MODE_INPUT);
+
+     gpio_set_pull_mode(GPIO_NUM_21, GPIO_PULLDOWN_ONLY);
+     gpio_set_pull_mode(GPIO_NUM_22, GPIO_PULLDOWN_ONLY);
+     gpio_set_pull_mode(GPIO_NUM_23, GPIO_PULLUP_ONLY);
+
 
 	i2s_driver_install(I2S_NUM_1, &i2s_config_rx, 0, NULL);
 	i2s_set_pin(I2S_NUM_1, &pin_config_rx);
@@ -152,17 +208,17 @@ void i2s_samplesread_ringbuf()
                                     //&bytes_read,  
                                     portMAX_DELAY); 
 
-                                 sum = 0; maxval = 0; ms = 0; rms = 0; avg_rms = 0; sum_rms = 0;
+                                     sum = 0; maxval = 0; ms = 0; rms = 0; avg_rms = 0; sum_rms = 0;
 
-                                 for (int i=0; i < I2S_BUFFER_SIZE; i++)
-                                         {       
-                                             sum +=  samples[i] / I2S_BUFFER_SIZE;
-                                         }
+                                     for (int i=0; i < I2S_BUFFER_SIZE; i++)
+                                             {       
+                                                 sum +=  samples[i] / I2S_BUFFER_SIZE;
+                                             }
 
-                                 for (int i=0; i < I2S_BUFFER_SIZE; i++)
-                                         {       
-                                             if (samples[i]>maxval) maxval=samples[i];
-                                         }
+                                     for (int i=0; i < I2S_BUFFER_SIZE; i++)
+                                             {       
+                                                 if (samples[i]>maxval) maxval=samples[i];
+                                             }
 
                                   sum = sum / I2S_BUFFER_SIZE;
                                   rms = (sqrt(pow(sum, 2))) / I2S_BUFFER_SIZE;
@@ -201,17 +257,51 @@ void i2s_samplesread_ringbuf()
 
 void i2s_samplesread()	 
 {   
-	    uint32_t *samples_ptr = samples;
+	    // int32_t *samples_ptr = samples;
 
-        while(1){
-                   i2s_read_bytes(
+        //while(1){
+                  i2s_read(
                          I2S_NUM_1, 
-                         (uint32_t *)samples, 
+                         (char *)samples, 
                          // read size * 4?
                          I2S_size*4,   
-                         //&bytes_read,  
+                         &bytes_read,  
                          portMAX_DELAY); 
-                }
+               // }
+}
+
+
+// ********************************************
+// I2S input 16 buffers naar samples_big buffer
+// 250ms delay voor DMA
+// ********************************************
+
+void i2s_readsamples_big()
+{
+
+size_t samples_big_size = I2S_size*16; // 32767 samples
+
+                    while(bytes_read < samples_big_size) 
+                        {
+
+                            for(int i=0; i<4;i++) // samples_big = 16 DMA buffers
+                                {
+                                    i2s_samplesread(); // DMA read 1 buffer
+                                    vTaskDelay(50 / portTICK_PERIOD_MS); // DMA finish
+
+                                        for(int j=0; j<I2S_size; j++)
+                                        {  
+                                           // append 1 buffer --> samples_big
+                                           samples_big[j+(I2S_size*i)] = samples[j];  
+                                        }
+                                }
+
+                                // print 32767 elements -- traag!
+                                for(int k=0; k<I2S_size*16; k++){
+                                    ESP_LOGW(TAG,"s[%d] = %d \n \n -------- \n \n",k, samples_big[k]);} 
+                        }
+
+                        bytes_read = 0; // reset i2s_read bytes_read 
 }
 
 
@@ -227,9 +317,12 @@ void fft(){
     float sum = 0.; float ms = 0.; float rms = 0.;
     float avg_sum = 0.; float avg_ms = 0.; float avg_rms = 0.;
 
+    init_i2s();
+
         while(1){
 
-            memset(y_cf,0,sizeof(y_cf)); memset(x1,0,sizeof(x1)); memset(wind,0,sizeof(x1));
+            memset(y_cf,0,sizeof(y_cf));
+            memset(wind,0,sizeof(wind));
             
             memset(s_codehistogram,0,sizeof(s_codehistogram));
             memset(output_data_float_lin,0,sizeof(output_data_float_lin));
@@ -251,8 +344,13 @@ void fft(){
                    dsps_wind_hann_f32(wind, N);
 
                    // test signaal, sinusbank met random amp & freq
-                   dsps_tone_gen_f32(x1, N, (esp_random() / (float) RAND_MAX), ((esp_random() / ((float) RAND_MAX)) / 2.) - 1., 0);            
+                   // dsps_tone_gen_f32(x1, N, (esp_random() / (float) RAND_MAX), 
+                   //                   ((esp_random() / ((float) RAND_MAX)) / 2.) - 1., 0);            
                         
+                   // I2S input 16 buffers naar samples_big buffer 
+                   i2s_readsamples_big(); 
+                   // !!! 250ms delay (te veel? optimizatie?) !!!
+
 				   for (uint16_t i = 0; i < BLOCK_SIZE ; i++) 
                        { 					   
 
@@ -271,7 +369,9 @@ void fft(){
                        // ****************************************************
 				       // SPH6045 mic als input -- shift van int32 naar int18 
 					   // #ifdef SPH6045
-                          y_cf[i * 2 + 0] = ((samples[i] >>= 14) + 0.0000001) * wind[i];
+
+                          y_cf[i * 2 + 0] = ((samples_big[i] >>= 14) + 0.0000001) * wind[i];
+
 					   // #endif
                        // ****************************************************
 
@@ -426,15 +526,23 @@ void fft(){
 
                      for (uint16_t i=0; i<SELECTEDBINS; i++) 
                           {
-                              s_spectrum[i] = 255*(cspctrm[i]/maxval);
+
+                              // calculate running average for as long as the ESP is awake
+                              s_spectrum[i] =+ (s_spectrum[i] + (255*(cspctrm[i]/maxval)) / fft_cnt);
+
                               ESP_LOGW(TAG,"s_spectrum[%d]= %d \n", i, s_spectrum[i]);   
                               ESP_LOGW(TAG,"cspctrm[%d]= %f \n", i, cspctrm[i]);     
                           }
 
+
+                      // increase counter of sets of FFTs done
+                      fft_cnt++;
+  
 				      // linear plot
-                      dsps_view(averagespectrum_lin, BLOCK_SIZE / 2, 160, 40, 0, 1500, '|');
+                      // dsps_view(averagespectrum_lin, BLOCK_SIZE / 2, 160, 40, 0, 1500, '|');
 	
                       dsps_fft2r_deinit_fc32(); 
+
         }
 }
 
@@ -443,29 +551,31 @@ void fft(){
 // heap debug 
 // ***********
 
+/*
 void heapdebug()
-/*      {
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*                ESP_LOGW(TAG,"\n -------- \n 8BIT\n");*/
-/*                heap_caps_print_heap_info(MALLOC_CAP_8BIT);*/
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*                ESP_LOGW(TAG,"\n -------- \n 32 BIT\n");*/
-/*                heap_caps_print_heap_info(MALLOC_CAP_32BIT);*/
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*                ESP_LOGW(TAG,"\n -------- \n EXEC \n");*/
-/*                heap_caps_print_heap_info(MALLOC_CAP_EXEC);*/
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*                ESP_LOGW(TAG,"\n -------- \n SPIRAM \n");*/
-/*                heap_caps_print_heap_info(MALLOC_CAP_SPIRAM);*/
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*                ESP_LOGW(TAG,"\n -------- \n DMA \n");*/
-/*                heap_caps_print_heap_info(MALLOC_CAP_DMA);*/
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*                ESP_LOGW(TAG,"\n -------- \n INTERNAL \n");*/
-/*                heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);*/
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*                ESP_LOGW(TAG,"\n -------- \n \n");*/
-/*      }*/
+      {
+                ESP_LOGW(TAG,"\n -------- \n \n");
+                ESP_LOGW(TAG,"\n -------- \n 8BIT\n");
+                heap_caps_print_heap_info(MALLOC_CAP_8BIT);
+                ESP_LOGW(TAG,"\n -------- \n \n");
+                ESP_LOGW(TAG,"\n -------- \n 32 BIT\n");
+                heap_caps_print_heap_info(MALLOC_CAP_32BIT);
+                ESP_LOGW(TAG,"\n -------- \n \n");
+                ESP_LOGW(TAG,"\n -------- \n EXEC \n");
+                heap_caps_print_heap_info(MALLOC_CAP_EXEC);
+                ESP_LOGW(TAG,"\n -------- \n \n");
+                ESP_LOGW(TAG,"\n -------- \n SPIRAM \n");
+                heap_caps_print_heap_info(MALLOC_CAP_SPIRAM);
+                ESP_LOGW(TAG,"\n -------- \n \n");
+                ESP_LOGW(TAG,"\n -------- \n DMA \n");
+                heap_caps_print_heap_info(MALLOC_CAP_DMA);
+                ESP_LOGW(TAG,"\n -------- \n \n");
+                ESP_LOGW(TAG,"\n -------- \n INTERNAL \n");
+                heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+                ESP_LOGW(TAG,"\n -------- \n \n");
+                ESP_LOGW(TAG,"\n -------- \n \n");
+      }
+*/
 
 
 // **********************
@@ -547,6 +657,7 @@ uint8_t calc_spectralcode(uint32_t *output_data_float_lin)
   /*  sort(s_code, s_codehistogram, 64);*/
   
   return code;
+
 }
 
 
@@ -554,11 +665,11 @@ uint8_t calc_spectralcode(uint32_t *output_data_float_lin)
 // deep sleep 
 // ***********
 
-void startDeepSleep();
+void startDeepSleep()
 {
     i2s_stop(I2S_NUM_1);
     esp_sleep_enable_timer_wakeup(sleep_us);	
-    esp_deep_sleep_start ();
+    esp_deep_sleep_start();
 }
 
 
@@ -588,7 +699,7 @@ void spiffswrite()
         // 2.25 MB voor I2S = 68 sec (32KB p/s @ 8192kHz, twee-kanaals)
         int32_t SPIFFS_size_i2s = 2250000; 
         // FFT is 2KB per spectrum: 1024 bins @ 16-bit depth 
-        int16_t SPIFFS_size_fft = 250000;
+        int32_t SPIFFS_size_fft = 250000;
 
 	    FILE* fp_i2s = fopen("/spiffs/i2s", "a");
 	    FILE* fp_fft_output_data = fopen("/spiffs/fft_output_data", "a");
@@ -685,11 +796,11 @@ void startTask_spiffswrite(){
 void app_main()
 {
 
-       startTask_i2s_samplesread(); 
+       // startTask_i2s_samplesread(); 
 
        startTask_fft();
 
-       startTask_spiffswrite(); 
+       // startTask_spiffswrite(); 
 
 }
 
